@@ -15,13 +15,13 @@ mod constants {
 
 const PRECISION: u128 = u64::MAX as u128;
 
-pub fn updatePointsBalance(
+pub fn update_points_balance(
     pool: &mut Account<Pool>,
     user: Option<&mut Box<Account<User>>>,
 ) -> Result<()> {
     let clock = clock::Clock::get().unwrap();
     if let Some(u) = user {
-        u.pointsDebt = unDebitedPoints(
+        u.points_debt = unDebitedPoints(
             u.balance_staked,
             pool.reward_per_token,
             u.last_update_time,
@@ -72,7 +72,7 @@ pub mod nftfarming {
         user.pool = *ctx.accounts.pool.to_account_info().key;
         user.owner = *ctx.accounts.owner.key;
         user.points_redeemed = 0;
-        user.pointsDebt = 0;
+        user.points_debt = 0;
         user.balance_staked = 0;
         user.nonce = nonce;
 
@@ -90,7 +90,7 @@ pub mod nftfarming {
         let pool = &mut ctx.accounts.pool;
 
         let user_opt = Some(&mut ctx.accounts.user);
-        updatePointsBalance(
+        update_points_balance(
             pool,
             user_opt,
         )
@@ -130,7 +130,7 @@ pub mod nftfarming {
         }
 
         let user_opt = Some(&mut ctx.accounts.user);
-        updatePointsBalance(
+        update_points_balance(
             &mut ctx.accounts.pool,
             user_opt,
         )
@@ -159,6 +159,77 @@ pub mod nftfarming {
             );
             token::transfer(cpi_ctx, spt_amount.try_into().unwrap())?;
         }
+
+        Ok(())
+    }
+
+    pub fn add_nft(
+        ctx: Context<AddNFT>,
+        price: u128,
+    ) -> Result<()> {
+
+        let pool = &mut ctx.accounts.pool;
+
+        let cpi_ctx = CpiContext::new(
+                                ctx.accounts.token_program.to_account_info(),
+                                token::Transfer {
+                                    from: ctx.accounts.from.to_account_info(),
+                                    to: ctx.accounts.staking_vault.to_account_info(),
+                                    authority: ctx.accounts.funder.to_account_info(),
+                                },
+                            );
+        token::transfer(cpi_ctx, 1)?;
+
+
+        pool.nfts.push(NFTInfo {
+            nft_mint: ctx.accounts.staking_mint.key(),
+            nft_vault: ctx.accounts.staking_vault.key(),
+            price: price,
+            redeemed: false
+        });
+        
+        Ok(())
+    }
+
+    pub fn claim_nft(
+        ctx: Context<ClaimNFT>,
+        nft_id: u8,
+    ) -> Result<()> {
+        let total_staked = ctx.accounts.staking_vault.amount;
+
+        let pool = &mut ctx.accounts.pool;
+
+        if pool.nfts[nft_id as usize].redeemed == true {
+            return Err(ErrorCode::NFTClaimed.into());
+        } 
+        if pool.nfts[nft_id as usize].nft_vault != ctx.accounts.nft_vault.key() {
+            return Err(ErrorCode::NotMyStakingVault.into());
+        }
+
+        let user_opt = Some(&mut ctx.accounts.user);
+        update_points_balance(
+            &mut ctx.accounts.pool,
+            user_opt,
+        ).unwrap();
+        
+        let seeds = &[
+            ctx.accounts.pool.to_account_info().key.as_ref(),
+            &[ctx.accounts.pool.nonce],
+        ];
+
+        let pool_signer = &[&seeds[..]];
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            token::Transfer {
+                from: ctx.accounts.nft_vault.to_account_info(),
+                to: ctx.accounts.receive_vault.to_account_info(),
+                authority: ctx.accounts.pool_signer.to_account_info(),
+            },
+        );
+        token::transfer(cpi_ctx, 1)?;
+        
+        &mut ctx.accounts.pool.nfts[nft_id as usize].redeemed = true;
 
         Ok(())
     }
@@ -198,12 +269,83 @@ pub struct InitializePool<'info> {
 
 
 #[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 8)]
-    pub my_account: Account<'info, Pool>,
+pub struct AddNFT<'info> {
+    #[account(
+        mut, 
+        has_one = staking_vault,
+    )]
+    pool: Box<Account<'info, Pool>>,
+
+    // Program signers.
+    #[account(
+        seeds = [
+            pool.to_account_info().key.as_ref()
+        ],
+        bump = pool.nonce,
+    )]
+    pool_signer: UncheckedAccount<'info>,
+
+    staking_mint: Box<Account<'info, Mint>>,
+    #[account(
+        constraint = staking_vault.mint == staking_mint.key(),
+        constraint = staking_vault.owner == pool_signer.key(),
+        //strangely, spl maintains this on owner reassignment for non-native accounts
+        //we don't want to be given an account that someone else could close when empty
+        //because in our "pool close" operation we want to assert it is still open
+        constraint = staking_vault.close_authority == COption::None,
+    )]
+    staking_vault: Box<Account<'info, TokenAccount>>,
+    
+    funder: Signer<'info>,
+
     #[account(mut)]
-    pub user: Signer<'info>,
-    pub system_program: Program<'info, System>,
+    from: Box<Account<'info, TokenAccount>>,
+
+    token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimNFT<'info> {
+    // Global accounts for the staking instance.
+    #[account(
+        mut, 
+        has_one = staking_vault,
+    )]
+    pool: Box<Account<'info, Pool>>,
+    #[account(mut)]
+    staking_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    receive_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    nft_vault: Box<Account<'info, TokenAccount>>,
+
+    // User.
+    #[account(
+        mut,
+        has_one = owner,
+        has_one = pool,
+        seeds = [
+            owner.to_account_info().key.as_ref(),
+            pool.to_account_info().key.as_ref()
+        ],
+        bump = user.nonce,
+    )]
+    user: Box<Account<'info, User>>,
+    owner: Signer<'info>,
+
+    // Program signers.
+    #[account(
+        seeds = [
+            pool.to_account_info().key.as_ref()
+        ],
+        bump = pool.nonce,
+    )]
+    pool_signer: UncheckedAccount<'info>,
+
+    // Misc.
+    token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -296,7 +438,7 @@ pub struct Pool {
     /// Users staked
     pub user_stake_count: u32,
     /// NFT Information
-    pub nft_info: Vec<NFTInfo>,
+    pub nfts: Vec<NFTInfo>,
     /// nonce
     pub nonce: u8,
     /// reward per token
@@ -317,7 +459,7 @@ pub struct User {
     /// The amount of points redeemed.
     pub points_redeemed: u128,
     /// Points Balance.
-    pub pointsDebt: u128,
+    pub points_debt: u128,
     /// The amount staked.
     pub balance_staked: u128,
     /// last update time.
@@ -344,4 +486,6 @@ pub enum ErrorCode {
     NFTClaimed,
     #[msg("Insufficient Points")]
     InsufficientPoints,
+    #[msg("NotMyStakingVault")]
+    NotMyStakingVault,
 }
